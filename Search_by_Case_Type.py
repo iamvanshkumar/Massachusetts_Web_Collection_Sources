@@ -501,9 +501,12 @@ def append_results_to_csv(rows, search_meta):
     write_header = not os.path.exists(filepath)
 
     fieldnames = [
+        # Search context
         "CourtDepartment", "CourtDivision", "SearchBeginDate", "SearchEndDate",
-        "PartyCompany", "CaseNumber", "CaseType", "FileDate",
-        "InitiatingAction", "PartyType", "DateOfBirth", "CaseStatus", "Court", "Affiliation"
+        # From results grid
+        "CaseNumber", "CaseType", "FileDate", "DateOfBirth", "CaseStatus", "Court",
+        # From case detail page
+        "NameRaw",
     ]
     with open(filepath, "a", newline="", encoding="utf-8", buffering=1) as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
@@ -512,7 +515,79 @@ def append_results_to_csv(rows, search_meta):
         for row in rows:
             writer.writerow({**search_meta, **row})
             f.flush()
-    log.info(f"[SAVE] {len(rows)} row(s) → {filepath}")
+    log.info(f"[SAVE] {len(rows)} row(s) -> {filepath}")
+
+
+def extract_name_raw(driver):
+    """
+    Extract NameRaw from the case detail page.
+    Looks for the first party whose ptyType is '- Defendant' and returns
+    the text of the sibling ptyInfoLabel div.
+    Falls back to the first ptyInfoLabel if no Defendant is found.
+    Returns empty string if nothing found.
+    """
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+
+    pty_container = soup.find("div", id="ptyContainer")
+    if not pty_container:
+        return ""
+
+    for party_div in pty_container.find_all("div", recursive=False):
+        header = party_div.find("div", class_="subSectionHeader2")
+        if not header:
+            continue
+        pty_type_div = header.find("div", class_="ptyType")
+        pty_name_div = header.find("div", class_="ptyInfoLabel")
+        if not pty_name_div:
+            continue
+        pty_type_text = pty_type_div.get_text(strip=True) if pty_type_div else ""
+        if "defendant" in pty_type_text.lower():
+            return pty_name_div.get_text(strip=True)
+
+    # Fallback: return first ptyInfoLabel found
+    first = pty_container.find("div", class_="ptyInfoLabel")
+    return first.get_text(strip=True) if first else ""
+
+
+def visit_and_enrich(driver, wait, result_rows, results_page_url):
+    """
+    For each result row, navigate to the case detail page, extract NameRaw,
+    then return to the results page.
+    Modifies result_rows in-place by adding 'NameRaw' to each dict.
+    """
+    for i, row in enumerate(result_rows):
+        href = row.pop("_case_href", "")
+        if not href:
+            row["NameRaw"] = ""
+            continue
+
+        case_num = row.get("CaseNumber", "?")
+        log.info(f"[DETAIL] [{i+1}/{len(result_rows)}] {case_num} -> {href[:60]}...")
+
+        try:
+            driver.get(href)
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.ID, "caseDetail"))
+            )
+            human_delay(1.0, 2.0)
+            row["NameRaw"] = extract_name_raw(driver)
+            log.info(f"[DETAIL] NameRaw='{row['NameRaw']}'")
+        except Exception as e:
+            log.warning(f"[DETAIL] Failed for {case_num}: {e}")
+            row["NameRaw"] = ""
+
+        # Return to results page
+        try:
+            driver.get(results_page_url)
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "table#grid"))
+            )
+            human_delay(0.8, 1.5)
+        except Exception as e:
+            log.warning(f"[DETAIL] Could not return to results page: {e}")
+
+    return result_rows
 
 
 # ============================================================================
@@ -556,8 +631,10 @@ def get_result_count(driver):
 
 def extract_results_from_page(driver):
     """
-    Parse all result rows from the current results page.
-    Returns list of dicts with keys matching the CSV fieldnames.
+    Parse result rows from the current results page.
+    Captures only: CaseNumber, CaseType, FileDate, DateOfBirth, CaseStatus, Court.
+    Also captures the href of the CaseNumber link for detail-page navigation.
+    Returns list of dicts.
     """
     from bs4 import BeautifulSoup
     soup = BeautifulSoup(driver.page_source, "html.parser")
@@ -565,6 +642,7 @@ def extract_results_from_page(driver):
     if not table:
         return []
 
+    base_url = "https://www.masscourts.org/eservices/"
     rows = []
     for tr in table.select("tbody tr"):
         tds = tr.find_all("td", recursive=False)
@@ -574,17 +652,21 @@ def extract_results_from_page(driver):
         def cell_text(td):
             return td.get_text(" ", strip=True)
 
+        # CaseNumber link href (col index 3)
+        case_link_tag = tds[3].find("a")
+        case_href = ""
+        if case_link_tag and case_link_tag.get("href"):
+            href = case_link_tag["href"]
+            case_href = base_url + href if href.startswith("?") else href
+
         rows.append({
-            "PartyCompany":     cell_text(tds[2]),
-            "CaseNumber":       cell_text(tds[3]),
-            "CaseType":         cell_text(tds[4]),
-            "FileDate":         cell_text(tds[5]),
-            "InitiatingAction": cell_text(tds[6]),
-            "PartyType":        cell_text(tds[7]),
-            "DateOfBirth":      cell_text(tds[8]),
-            "CaseStatus":       cell_text(tds[9]),
-            "Court":            cell_text(tds[10]),
-            "Affiliation":      cell_text(tds[11]) if len(tds) > 11 else "",
+            "CaseNumber":  cell_text(tds[3]),
+            "CaseType":    cell_text(tds[4]),
+            "FileDate":    cell_text(tds[5]),
+            "DateOfBirth": cell_text(tds[8]),
+            "CaseStatus":  cell_text(tds[9]),
+            "Court":       cell_text(tds[10]),
+            "_case_href":  case_href,   # internal — used for navigation, not written to CSV
         })
     return rows
 
@@ -592,8 +674,9 @@ def extract_results_from_page(driver):
 def paginate_and_collect(driver, wait):
     """
     Collect all rows across all pages of the current results.
-    Uses the next-page navigator (span title='Go to next page').
-    Returns list of row dicts.
+    For each page: extract grid rows, visit each case detail page to get
+    NameRaw, then move to the next page.
+    Returns list of enriched row dicts.
     """
     all_rows = []
     page_num = 1
@@ -604,9 +687,16 @@ def paginate_and_collect(driver, wait):
         )
         human_delay(1.0, 1.5)
 
+        # Save current results page URL before navigating away
+        results_page_url = driver.current_url
+
         rows = extract_results_from_page(driver)
+        log.info(f"[PAGE {page_num}] Found {len(rows)} rows — visiting detail pages...")
+
+        # Enrich with NameRaw from each case detail page
+        rows = visit_and_enrich(driver, wait, rows, results_page_url)
         all_rows.extend(rows)
-        log.info(f"[PAGE {page_num}] Extracted {len(rows)} rows (total so far: {len(all_rows)})")
+        log.info(f"[PAGE {page_num}] Done. Total so far: {len(all_rows)}")
 
         # Check for an active next-page button
         try:
@@ -614,7 +704,6 @@ def paginate_and_collect(driver, wait):
                 By.XPATH,
                 "//span[@title='Go to next page' and not(contains(@class,'disabled'))]"
             )
-            # Verify it's actually clickable (has an onclick or is inside an <a>)
             parent = next_btn.find_element(By.XPATH, "..")
             if parent.tag_name == "a" or next_btn.get_attribute("onclick"):
                 driver.execute_script("arguments[0].click();", next_btn)
