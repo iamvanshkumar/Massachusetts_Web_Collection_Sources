@@ -491,8 +491,26 @@ def open_and_enter_site(driver, wait):
 
 SEARCH_CSV = "sample_data.csv"
 
-# Maps the display name in the CSV to the <option value> in the Court Department dropdown
-DEPT_VALUE_MAP = {
+# Maps CSV display names → <option value> for Case Type (name="caseCd")
+CASE_TYPE_VALUE_MAP = {
+    "Civil":                  "CV                            ",
+    "Criminal":               "CR                            ",
+    "Criminal Cross Site":    "CRX                           ",
+    "Drug Court":             "DTX                           ",
+    "Small Claims":           "SC                            ",
+    "Specialty TX":           "MTX                           ",
+    "Summary Process":        "SU                            ",
+    "Supplementary Process":  "SP                            ",
+    "Veterans Specialty":     "VTX                           ",
+}
+
+# Maps CSV display names → <option value> for Party Type (name="ptyCd")
+PARTY_TYPE_VALUE_MAP = {
+    "All Party Types": " ",
+    "Defendant":       "DFNDT                         ",
+    "Plaintiff":       "PLNTF                         ",
+    "Trustee":         "TRUST                         ",
+}
     "BMC":                        "BMC_DEPT  ",
     "District Court":             "DC_DEPT   ",
     "Housing Court":              "HC_DEPT   ",
@@ -534,7 +552,163 @@ def wicket_select(driver, select_el, value_or_text, by_value=False):
     human_delay(1.5, 2.5)   # let Wicket AJAX update the dependent dropdowns
 
 
-def fill_search_form(driver, wait, row):
+def convert_date(date_str):
+    """
+    Convert DD-MM-YYYY (CSV format) → MM/DD/YYYY (site format).
+    Falls back to the original string if parsing fails.
+    """
+    for fmt in ("%d-%m-%Y", "%m/%d/%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(date_str.strip(), fmt).strftime("%m/%d/%Y")
+        except ValueError:
+            pass
+    log.warning(f"[DATE] Could not parse date '{date_str}', using as-is.")
+    return date_str
+
+
+def fill_case_type_tab(driver, wait, row):
+    """
+    Fill the Case Type tab form:
+      - Begin Date / End Date  (from CSV FilingDateFrom / FilingDateTo)
+      - Case Type              (from CSV CaseType, multi-select)
+      - City/Town              → keep "All Cities"
+      - Case Status            → keep "All Statuses"
+      - Party Type             (from CSV PartyType, multi-select)
+    Then click Search.
+    """
+    begin_raw  = row.get("FilingDateFrom", "").strip()
+    end_raw    = row.get("FilingDateTo",   "").strip()
+    begin_date = convert_date(begin_raw)
+    end_date   = convert_date(end_raw)
+    case_type  = row.get("CaseType",   "").strip()
+    party_type = row.get("PartyType",  "").strip()
+
+    log.info(f"[TAB] Begin={begin_date}  End={end_date}  "
+             f"CaseType='{case_type}'  PartyType='{party_type}'")
+
+    # ── Begin Date ────────────────────────────────────────────────────────────
+    try:
+        begin_input = wait.until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "input[name='fileDateRange:dateInputBegin']")
+            )
+        )
+        begin_input.clear()
+        begin_input.send_keys(begin_date)
+        # Trigger onchange so Wicket registers the value
+        driver.execute_script("arguments[0].dispatchEvent(new Event('change'));", begin_input)
+        human_delay(0.5, 1.0)
+        log.info(f"[TAB] Set Begin Date: {begin_date}")
+    except Exception as e:
+        log.error(f"[TAB] Could not set Begin Date: {e}")
+        return False
+
+    # ── End Date ──────────────────────────────────────────────────────────────
+    try:
+        end_input = wait.until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "input[name='fileDateRange:dateInputEnd']")
+            )
+        )
+        end_input.clear()
+        end_input.send_keys(end_date)
+        driver.execute_script("arguments[0].dispatchEvent(new Event('change'));", end_input)
+        human_delay(0.5, 1.0)
+        log.info(f"[TAB] Set End Date: {end_date}")
+    except Exception as e:
+        log.error(f"[TAB] Could not set End Date: {e}")
+        return False
+
+    # ── Case Type (multi-select, name="caseCd") ───────────────────────────────
+    case_type_value = CASE_TYPE_VALUE_MAP.get(case_type)
+    if not case_type_value:
+        log.error(f"[TAB] Unknown CaseType '{case_type}'. "
+                  f"Valid: {list(CASE_TYPE_VALUE_MAP.keys())}")
+        return False
+    try:
+        case_type_el = wait.until(
+            EC.presence_of_element_located((By.NAME, "caseCd"))
+        )
+        sel = Select(case_type_el)
+        sel.deselect_all()
+        sel.select_by_value(case_type_value)
+        driver.execute_script(
+            "arguments[0].dispatchEvent(new Event('change'));", case_type_el
+        )
+        human_delay(0.5, 1.0)
+        log.info(f"[TAB] Selected Case Type: {case_type}")
+    except Exception as e:
+        log.error(f"[TAB] Could not select Case Type: {e}")
+        return False
+
+    # ── City/Town → "All Cities" (value=" ", already default — ensure it) ─────
+    try:
+        city_el = wait.until(
+            EC.presence_of_element_located((By.NAME, "cityCd"))
+        )
+        sel = Select(city_el)
+        sel.deselect_all()
+        sel.select_by_value(" ")
+        log.info("[TAB] City/Town set to All Cities.")
+        human_delay(0.3, 0.6)
+    except Exception as e:
+        log.warning(f"[TAB] Could not set City/Town (non-fatal): {e}")
+
+    # ── Case Status → "All Statuses" (value=" ", already default — ensure it) ─
+    try:
+        stat_el = wait.until(
+            EC.presence_of_element_located((By.NAME, "statCd"))
+        )
+        sel = Select(stat_el)
+        sel.deselect_all()
+        sel.select_by_value(" ")
+        log.info("[TAB] Case Status set to All Statuses.")
+        human_delay(0.3, 0.6)
+    except Exception as e:
+        log.warning(f"[TAB] Could not set Case Status (non-fatal): {e}")
+
+    # ── Party Type (multi-select, name="ptyCd") ───────────────────────────────
+    party_value = PARTY_TYPE_VALUE_MAP.get(party_type)
+    if not party_value:
+        log.warning(f"[TAB] Unknown PartyType '{party_type}', defaulting to All Party Types.")
+        party_value = " "
+    try:
+        party_el = wait.until(
+            EC.presence_of_element_located((By.NAME, "ptyCd"))
+        )
+        sel = Select(party_el)
+        sel.deselect_all()
+        sel.select_by_value(party_value)
+        human_delay(0.3, 0.6)
+        log.info(f"[TAB] Selected Party Type: {party_type}")
+    except Exception as e:
+        log.error(f"[TAB] Could not select Party Type: {e}")
+        return False
+
+    # ── Click Search ──────────────────────────────────────────────────────────
+    try:
+        search_btn = wait.until(
+            EC.element_to_be_clickable(
+                (By.CSS_SELECTOR, "input[type='submit'][name='submitLink']")
+            )
+        )
+        human_delay(0.5, 1.0)
+        driver.execute_script("arguments[0].click();", search_btn)
+        log.info("[TAB] Clicked Search.")
+    except Exception as e:
+        log.error(f"[TAB] Could not click Search: {e}")
+        return False
+
+    # Wait for results page to load (processing dialog disappears)
+    try:
+        WebDriverWait(driver, 30).until(
+            EC.invisibility_of_element_located((By.ID, "processingDialog"))
+        )
+    except Exception:
+        pass
+    human_delay(2.0, 3.0)
+    log.info(f"[TAB] Search submitted. URL: {driver.current_url}")
+    return True
     """
     Fill the search qualifier form for one CSV row:
       1. Select Court Department  (triggers AJAX → reveals Division dropdown)
@@ -589,7 +763,34 @@ def fill_search_form(driver, wait, row):
         log.error(f"[FORM] Could not set page size: {e}")
         return False
 
-    return True
+    # ── 4. Click "Case Type" tab ─────────────────────────────────────────────
+    try:
+        case_type_tab = wait.until(
+            EC.element_to_be_clickable(
+                (By.XPATH,
+                 "//ul/li/a[.//span[normalize-space(text())='Case Type']]")
+            )
+        )
+        driver.execute_script("arguments[0].click();", case_type_tab)
+        log.info("[FORM] Clicked 'Case Type' tab.")
+
+        # Wait for the tab panel to update — the tab li gets class 'selected'
+        WebDriverWait(driver, 15).until(
+            lambda d: "selected" in (
+                d.find_element(
+                    By.XPATH,
+                    "//ul/li[.//span[normalize-space(text())='Case Type']]"
+                ).get_attribute("class") or ""
+            )
+        )
+        human_delay(1.0, 2.0)
+        log.info("[FORM] 'Case Type' tab is now active.")
+    except Exception as e:
+        log.error(f"[FORM] Could not click 'Case Type' tab: {e}")
+        return False
+
+    # ── 5. Fill Case Type tab form and submit ────────────────────────────────
+    return fill_case_type_tab(driver, wait, row)
 
 
 # ============================================================================
@@ -631,8 +832,8 @@ def main():
 
             ok = fill_search_form(driver, wait, row)
             if ok:
-                log.info(f"[DONE] Step 2 complete for row {i+1}.")
-                # Step 3 (submit + paginate + extract) will be added here
+                log.info(f"[DONE] Steps 2+3 complete for row {i+1} — search submitted.")
+                # Step 4 (paginate + extract results) will be added here
             else:
                 log.warning(f"[SKIP] Row {i+1} — form fill failed.")
 
