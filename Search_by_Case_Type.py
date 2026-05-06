@@ -716,6 +716,9 @@ PARTY_TYPE_VALUE_MAP = {
     "Plaintiff":       "PLNTF                         ",
     "Trustee":         "TRUST                         ",
 }
+
+# Maps the display name in the CSV to the <option value> in the Court Department dropdown
+DEPT_VALUE_MAP = {
     "BMC":                        "BMC_DEPT  ",
     "District Court":             "DC_DEPT   ",
     "Housing Court":              "HC_DEPT   ",
