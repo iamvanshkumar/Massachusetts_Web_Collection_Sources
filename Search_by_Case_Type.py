@@ -12,8 +12,9 @@ import base64
 import io
 import os
 import csv
+import re
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -486,8 +487,212 @@ def open_and_enter_site(driver, wait):
     return True
 
 # ============================================================================
-# CSV Loader
+# Output
 # ============================================================================
+
+OUTPUT_DIR = "output"
+
+def append_results_to_csv(rows, search_meta):
+    """Append extracted result rows to output/results.csv."""
+    if not rows:
+        return
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    filepath     = os.path.join(OUTPUT_DIR, "results.csv")
+    write_header = not os.path.exists(filepath)
+
+    fieldnames = [
+        "CourtDepartment", "CourtDivision", "SearchBeginDate", "SearchEndDate",
+        "PartyCompany", "CaseNumber", "CaseType", "FileDate",
+        "InitiatingAction", "PartyType", "DateOfBirth", "CaseStatus", "Court", "Affiliation"
+    ]
+    with open(filepath, "a", newline="", encoding="utf-8", buffering=1) as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
+        if write_header:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow({**search_meta, **row})
+            f.flush()
+    log.info(f"[SAVE] {len(rows)} row(s) → {filepath}")
+
+
+# ============================================================================
+# Results page — extraction + pagination + smart date splitting
+# ============================================================================
+
+def get_result_count(driver):
+    """
+    Parse the result count from the page.
+    Returns (shown, total) e.g. (75, 206) or (69, 69).
+    Returns (0, 0) if not found.
+    """
+    try:
+        # "Showing 1 to 69 of 69"  or  "Returning 100 of 206 records."
+        texts = []
+        for sel in ["#id14a", "#srchResultNotice", ".navigatorLabel span"]:
+            try:
+                el = driver.find_element(By.CSS_SELECTOR, sel)
+                texts.append(el.text.strip())
+            except Exception:
+                pass
+
+        for text in texts:
+            # "Showing X to Y of Z"
+            m = re.search(r"Showing\s+\d+\s+to\s+(\d+)\s+of\s+(\d+)", text, re.I)
+            if m:
+                return int(m.group(1)), int(m.group(2))
+            # "Returning X of Y records"
+            m = re.search(r"Returning\s+(\d+)\s+of\s+(\d+)", text, re.I)
+            if m:
+                return int(m.group(1)), int(m.group(2))
+            # "Showing 1 to X of X"
+            m = re.search(r"of\s+(\d+)", text, re.I)
+            if m:
+                n = int(m.group(1))
+                return n, n
+    except Exception:
+        pass
+    return 0, 0
+
+
+def extract_results_from_page(driver):
+    """
+    Parse all result rows from the current results page.
+    Returns list of dicts with keys matching the CSV fieldnames.
+    """
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    table = soup.find("table", id="grid")
+    if not table:
+        return []
+
+    rows = []
+    for tr in table.select("tbody tr"):
+        tds = tr.find_all("td", recursive=False)
+        if len(tds) < 11:
+            continue
+
+        def cell_text(td):
+            return td.get_text(" ", strip=True)
+
+        rows.append({
+            "PartyCompany":     cell_text(tds[2]),
+            "CaseNumber":       cell_text(tds[3]),
+            "CaseType":         cell_text(tds[4]),
+            "FileDate":         cell_text(tds[5]),
+            "InitiatingAction": cell_text(tds[6]),
+            "PartyType":        cell_text(tds[7]),
+            "DateOfBirth":      cell_text(tds[8]),
+            "CaseStatus":       cell_text(tds[9]),
+            "Court":            cell_text(tds[10]),
+            "Affiliation":      cell_text(tds[11]) if len(tds) > 11 else "",
+        })
+    return rows
+
+
+def paginate_and_collect(driver, wait):
+    """
+    Collect all rows across all pages of the current results.
+    Uses the next-page navigator (span title='Go to next page').
+    Returns list of row dicts.
+    """
+    all_rows = []
+    page_num = 1
+
+    while True:
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "table#grid tbody tr"))
+        )
+        human_delay(1.0, 1.5)
+
+        rows = extract_results_from_page(driver)
+        all_rows.extend(rows)
+        log.info(f"[PAGE {page_num}] Extracted {len(rows)} rows (total so far: {len(all_rows)})")
+
+        # Check for an active next-page button
+        try:
+            next_btn = driver.find_element(
+                By.XPATH,
+                "//span[@title='Go to next page' and not(contains(@class,'disabled'))]"
+            )
+            # Verify it's actually clickable (has an onclick or is inside an <a>)
+            parent = next_btn.find_element(By.XPATH, "..")
+            if parent.tag_name == "a" or next_btn.get_attribute("onclick"):
+                driver.execute_script("arguments[0].click();", next_btn)
+                human_delay(2.0, 3.0)
+                page_num += 1
+            else:
+                break
+        except Exception:
+            break
+
+    return all_rows
+
+
+def date_range_chunks(begin_str, end_str, chunk="week"):
+    """
+    Split a date range (MM/DD/YYYY strings) into sub-ranges.
+    chunk = 'week' → 7-day chunks
+    chunk = 'day'  → 1-day chunks
+    Yields (begin_str, end_str) pairs.
+    """
+    fmt = "%m/%d/%Y"
+    start = datetime.strptime(begin_str, fmt)
+    end   = datetime.strptime(end_str,   fmt)
+    delta = timedelta(days=6 if chunk == "week" else 0)
+
+    current = start
+    while current <= end:
+        chunk_end = min(current + delta, end)
+        yield current.strftime(fmt), chunk_end.strftime(fmt)
+        current = chunk_end + timedelta(days=1)
+
+
+def collect_with_smart_split(driver, wait, row, begin_date, end_date, depth=0):
+    """
+    Recursively collect results, splitting the date range if >100 records.
+    depth 0 = month range, depth 1 = week chunks, depth 2 = day chunks.
+    Returns list of row dicts.
+    """
+    MAX_DEPTH = 2
+    CHUNK_NAMES = ["month", "week", "day"]
+
+    log.info(f"[SPLIT] Searching {begin_date} → {end_date} "
+             f"(depth={depth}, chunk={CHUNK_NAMES[depth]})")
+
+    # Fill and submit the form for this date range
+    sub_row = {**row, "FilingDateFrom": begin_date, "FilingDateTo": end_date}
+    # Dates already in MM/DD/YYYY — pass directly (convert_date will pass through)
+    ok = fill_search_form(driver, wait, sub_row)
+    if not ok:
+        log.warning(f"[SPLIT] Form fill failed for {begin_date}→{end_date}")
+        return []
+
+    # Wait for results
+    try:
+        WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "table#grid, #srchResultNotice"))
+        )
+        human_delay(1.5, 2.5)
+    except Exception:
+        pass
+
+    shown, total = get_result_count(driver)
+    log.info(f"[SPLIT] Results: shown={shown}, total={total}")
+
+    if total <= 100 or depth >= MAX_DEPTH:
+        # Collect all pages
+        return paginate_and_collect(driver, wait)
+
+    # Need to split further
+    next_chunk = "week" if depth == 0 else "day"
+    all_rows = []
+    for chunk_begin, chunk_end in date_range_chunks(begin_date, end_date, chunk=next_chunk):
+        chunk_rows = collect_with_smart_split(
+            driver, wait, row, chunk_begin, chunk_end, depth=depth + 1
+        )
+        all_rows.extend(chunk_rows)
+        human_delay(1.0, 2.0)
+    return all_rows
 
 SEARCH_CSV = "sample_data.csv"
 
@@ -825,18 +1030,25 @@ def main():
         log.info("[DONE] Step 1 complete — now on search page.")
         log.info(f"[URL]  {driver.current_url}")
 
-        # ── Step 2: fill search form for each CSV row ─────────────────────────
+        # ── Step 2+3: for each CSV row, fill form + collect results ──────────
         for i, row in enumerate(search_rows):
-            log.info(f"--- [{i+1}/{len(search_rows)}] "
-                     f"{row.get('CourtDepartments')} / {row.get('CourtDivision')} ---")
+            dept   = row.get("CourtDepartments", "")
+            div    = row.get("CourtDivision", "")
+            begin  = convert_date(row.get("FilingDateFrom", ""))
+            end    = convert_date(row.get("FilingDateTo", ""))
+            log.info(f"--- [{i+1}/{len(search_rows)}] {dept} / {div} "
+                     f"{begin} → {end} ---")
 
-            ok = fill_search_form(driver, wait, row)
-            if ok:
-                log.info(f"[DONE] Steps 2+3 complete for row {i+1} — search submitted.")
-                # Step 4 (paginate + extract results) will be added here
-            else:
-                log.warning(f"[SKIP] Row {i+1} — form fill failed.")
+            search_meta = {
+                "CourtDepartment":  dept,
+                "CourtDivision":    div,
+                "SearchBeginDate":  begin,
+                "SearchEndDate":    end,
+            }
 
+            all_rows = collect_with_smart_split(driver, wait, row, begin, end, depth=0)
+            log.info(f"[DONE] Row {i+1}: collected {len(all_rows)} total records.")
+            append_results_to_csv(all_rows, search_meta)
             human_delay(2.0, 3.0)
 
     except Exception as e:
