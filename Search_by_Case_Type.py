@@ -647,6 +647,92 @@ def date_range_chunks(begin_str, end_str, chunk="week"):
         current = chunk_end + timedelta(days=1)
 
 
+def run_one_search(driver, wait, row):
+    """
+    Navigate to the search page (using 'Revise Current Search' if already on
+    results, or directly to the search URL), fill the qualifier form
+    (Department → Division → page size), click the Case Type tab, fill that
+    form, and submit.  Returns True on success.
+    """
+    # If we're on the results page, click "Revise Current Search" to go back
+    # to the search form without losing the session.  Otherwise navigate directly.
+    try:
+        revise_link = driver.find_element(
+            By.XPATH,
+            "//a[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
+            "'abcdefghijklmnopqrstuvwxyz'),'revise current search')]"
+        )
+        driver.execute_script("arguments[0].click();", revise_link)
+        log.info("[NAV] Clicked 'Revise Current Search'.")
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.NAME, "sdeptCd"))
+        )
+        human_delay(1.5, 2.5)
+    except Exception:
+        # Not on results page — fill the qualifier form that's already visible
+        pass
+
+    # ── Qualifier form: Department → Division → page size ────────────────────
+    dept_display = row.get("CourtDepartments", "").strip()
+    div_display  = row.get("CourtDivision", "").strip()
+
+    dept_value = DEPT_VALUE_MAP.get(dept_display)
+    if not dept_value:
+        log.error(f"[FORM] Unknown department '{dept_display}'.")
+        return False
+
+    try:
+        dept_select_el = wait.until(EC.presence_of_element_located((By.NAME, "sdeptCd")))
+        wicket_select(driver, dept_select_el, dept_value, by_value=True)
+        log.info(f"[FORM] Selected department: {dept_display}")
+    except Exception as e:
+        log.error(f"[FORM] Could not select department: {e}")
+        return False
+
+    try:
+        div_select_el = WebDriverWait(driver, 15).until(
+            EC.visibility_of_element_located((By.NAME, "sdivCd"))
+        )
+        wicket_select(driver, div_select_el, div_display, by_value=False)
+        log.info(f"[FORM] Selected division: {div_display}")
+    except Exception as e:
+        log.error(f"[FORM] Could not select division '{div_display}': {e}")
+        return False
+
+    try:
+        page_size_el = wait.until(EC.presence_of_element_located((By.NAME, "pageSize")))
+        wicket_select(driver, page_size_el, "75", by_value=False)
+        log.info("[FORM] Set results per page to 75.")
+    except Exception as e:
+        log.error(f"[FORM] Could not set page size: {e}")
+        return False
+
+    # ── Case Type tab ─────────────────────────────────────────────────────────
+    try:
+        case_type_tab = wait.until(
+            EC.element_to_be_clickable(
+                (By.XPATH, "//ul/li/a[.//span[normalize-space(text())='Case Type']]")
+            )
+        )
+        driver.execute_script("arguments[0].click();", case_type_tab)
+        WebDriverWait(driver, 15).until(
+            lambda d: "selected" in (
+                d.find_element(
+                    By.XPATH,
+                    "//ul/li[.//span[normalize-space(text())='Case Type']]"
+                ).get_attribute("class") or ""
+            )
+        )
+        human_delay(1.0, 2.0)
+        log.info("[FORM] 'Case Type' tab active.")
+    except Exception as e:
+        log.error(f"[FORM] Could not click 'Case Type' tab: {e}")
+        return False
+
+    # ── Case Type tab form + submit ───────────────────────────────────────────
+    return fill_case_type_tab(driver, wait, row)
+
+
 def collect_with_smart_split(driver, wait, row, begin_date, end_date, depth=0):
     """
     Recursively collect results, splitting the date range if >100 records.
@@ -662,7 +748,7 @@ def collect_with_smart_split(driver, wait, row, begin_date, end_date, depth=0):
     # Fill and submit the form for this date range
     sub_row = {**row, "FilingDateFrom": begin_date, "FilingDateTo": end_date}
     # Dates already in MM/DD/YYYY — pass directly (convert_date will pass through)
-    ok = fill_search_form(driver, wait, sub_row)
+    ok = run_one_search(driver, wait, sub_row)
     if not ok:
         log.warning(f"[SPLIT] Form fill failed for {begin_date}→{end_date}")
         return []
@@ -917,7 +1003,6 @@ def fill_case_type_tab(driver, wait, row):
     human_delay(2.0, 3.0)
     log.info(f"[TAB] Search submitted. URL: {driver.current_url}")
     return True
-    """
     Fill the search qualifier form for one CSV row:
       1. Select Court Department  (triggers AJAX → reveals Division dropdown)
       2. Select Court Division    (triggers AJAX → reveals Location dropdown)
