@@ -518,6 +518,27 @@ def append_results_to_csv(rows, search_meta):
     log.info(f"[SAVE] {len(rows)} row(s) -> {filepath}")
 
 
+def write_row_to_csv(row, search_meta):
+    """Write a single enriched row to output/results.csv immediately."""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    filepath     = os.path.join(OUTPUT_DIR, "results.csv")
+    write_header = not os.path.exists(filepath)
+
+    fieldnames = [
+        "CourtDepartment", "CourtDivision", "SearchBeginDate", "SearchEndDate",
+        "CaseNumber", "CaseType", "FileDate", "DateOfBirth", "CaseStatus", "Court",
+        "NameRaw",
+    ]
+    with open(filepath, "a", newline="", encoding="utf-8", buffering=1) as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
+        if write_header:
+            writer.writeheader()
+            f.flush()
+        writer.writerow({**search_meta, **row})
+        f.flush()
+        os.fsync(f.fileno())
+
+
 def extract_name_raw(driver):
     """
     Extract NameRaw from the case detail page.
@@ -550,20 +571,23 @@ def extract_name_raw(driver):
     return first.get_text(strip=True) if first else ""
 
 
-def visit_and_enrich(driver, wait, result_rows, results_page_url):
+def visit_and_enrich(driver, wait, result_rows, results_page_url, search_meta):
     """
-    For each result row, navigate to the case detail page, extract NameRaw,
-    then return to the results page.
-    Modifies result_rows in-place by adding 'NameRaw' to each dict.
+    For each result row:
+      1. Navigate to the case detail page
+      2. Extract NameRaw
+      3. Write the row to CSV immediately (runtime, one row per case)
+      4. Return to the results page
     """
     for i, row in enumerate(result_rows):
         href = row.pop("_case_href", "")
         if not href:
             row["NameRaw"] = ""
+            write_row_to_csv(row, search_meta)
             continue
 
         case_num = row.get("CaseNumber", "?")
-        log.info(f"[DETAIL] [{i+1}/{len(result_rows)}] {case_num} -> {href[:60]}...")
+        log.info(f"[DETAIL] [{i+1}/{len(result_rows)}] {case_num}")
 
         try:
             driver.get(href)
@@ -577,6 +601,10 @@ def visit_and_enrich(driver, wait, result_rows, results_page_url):
             log.warning(f"[DETAIL] Failed for {case_num}: {e}")
             row["NameRaw"] = ""
 
+        # Write immediately — one row, one case
+        write_row_to_csv(row, search_meta)
+        log.info(f"[SAVE]   Written: {case_num}")
+
         # Return to results page
         try:
             driver.get(results_page_url)
@@ -586,8 +614,6 @@ def visit_and_enrich(driver, wait, result_rows, results_page_url):
             human_delay(0.8, 1.5)
         except Exception as e:
             log.warning(f"[DETAIL] Could not return to results page: {e}")
-
-    return result_rows
 
 
 # ============================================================================
@@ -671,14 +697,14 @@ def extract_results_from_page(driver):
     return rows
 
 
-def paginate_and_collect(driver, wait):
+def paginate_and_collect(driver, wait, search_meta):
     """
-    Collect all rows across all pages of the current results.
-    For each page: extract grid rows, visit each case detail page to get
-    NameRaw, then move to the next page.
-    Returns list of enriched row dicts.
+    Iterate all pages of the current results.
+    For each page: extract grid rows, visit each case detail page,
+    write one CSV row per case immediately, then move to the next page.
+    Returns total count of rows written.
     """
-    all_rows = []
+    total = 0
     page_num = 1
 
     while True:
@@ -687,18 +713,15 @@ def paginate_and_collect(driver, wait):
         )
         human_delay(1.0, 1.5)
 
-        # Save current results page URL before navigating away
         results_page_url = driver.current_url
-
         rows = extract_results_from_page(driver)
-        log.info(f"[PAGE {page_num}] Found {len(rows)} rows — visiting detail pages...")
+        log.info(f"[PAGE {page_num}] {len(rows)} rows — visiting detail pages...")
 
-        # Enrich with NameRaw from each case detail page
-        rows = visit_and_enrich(driver, wait, rows, results_page_url)
-        all_rows.extend(rows)
-        log.info(f"[PAGE {page_num}] Done. Total so far: {len(all_rows)}")
+        visit_and_enrich(driver, wait, rows, results_page_url, search_meta)
+        total += len(rows)
+        log.info(f"[PAGE {page_num}] Done. Total written so far: {total}")
 
-        # Check for an active next-page button
+        # Next page
         try:
             next_btn = driver.find_element(
                 By.XPATH,
@@ -714,7 +737,7 @@ def paginate_and_collect(driver, wait):
         except Exception:
             break
 
-    return all_rows
+    return total
 
 
 def date_range_chunks(begin_str, end_str, chunk="week"):
@@ -822,7 +845,7 @@ def run_one_search(driver, wait, row):
     return fill_case_type_tab(driver, wait, row)
 
 
-def collect_with_smart_split(driver, wait, row, begin_date, end_date, depth=0):
+def collect_with_smart_split(driver, wait, row, begin_date, end_date, search_meta, depth=0):
     """
     Recursively collect results, splitting the date range if >100 records.
     depth 0 = month range, depth 1 = week chunks, depth 2 = day chunks.
@@ -855,19 +878,19 @@ def collect_with_smart_split(driver, wait, row, begin_date, end_date, depth=0):
     log.info(f"[SPLIT] Results: shown={shown}, total={total}")
 
     if total <= 100 or depth >= MAX_DEPTH:
-        # Collect all pages
-        return paginate_and_collect(driver, wait)
+        # Collect all pages, write each row immediately
+        return paginate_and_collect(driver, wait, search_meta)
 
     # Need to split further
     next_chunk = "week" if depth == 0 else "day"
-    all_rows = []
+    total_written = 0
     for chunk_begin, chunk_end in date_range_chunks(begin_date, end_date, chunk=next_chunk):
-        chunk_rows = collect_with_smart_split(
-            driver, wait, row, chunk_begin, chunk_end, depth=depth + 1
+        chunk_written = collect_with_smart_split(
+            driver, wait, row, chunk_begin, chunk_end, search_meta, depth=depth + 1
         )
-        all_rows.extend(chunk_rows)
+        total_written += chunk_written
         human_delay(1.0, 2.0)
-    return all_rows
+    return total_written
 
 SEARCH_CSV = "sample_data.csv"
 
@@ -1142,9 +1165,8 @@ def main():
                 "SearchEndDate":    end,
             }
 
-            all_rows = collect_with_smart_split(driver, wait, row, begin, end, depth=0)
-            log.info(f"[DONE] Row {i+1}: collected {len(all_rows)} total records.")
-            append_results_to_csv(all_rows, search_meta)
+            all_rows = collect_with_smart_split(driver, wait, row, begin, end, search_meta, depth=0)
+            log.info(f"[DONE] Row {i+1}: {all_rows} total records written.")
             human_delay(2.0, 3.0)
 
     except Exception as e:
