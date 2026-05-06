@@ -1,0 +1,7 @@
+CourtDepartments,CourtDivision,CaseType,PartyType,FilingDateFrom,FilingDateTo
+BMC,BMC Brighton,Criminal,Defendant,01-06-2025,30-06-2025
+BMC,BMC Central,Criminal,Defendant,01-06-2025,30-06-2025
+BMC,BMC Charlestown,Criminal,Defendant,01-06-2025,30-06-2025
+BMC,BMC Dorchester,Criminal,Defendant,01-06-2025,30-06-2025
+BMC,BMC East Boston,Criminal,Defendant,01-06-2025,30-06-2025
+BMC,BMC Roxbury,Criminal,Defendant,01-06-2025,30-06-2025

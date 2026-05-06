@@ -2,7 +2,7 @@
 Massachusetts Trial Court Case Access — Search by Case Type
 Flow (incremental build):
   Step 1: Open home page → solve reCAPTCHA → click "Click Here" to enter search
-  Step 2: (coming) Fill search form by case type / date / court
+  Step 2: Fill search form — Court Department, Court Division, Number of Results
   Step 3: (coming) Paginate results and extract case data
 """
 
@@ -11,6 +11,7 @@ import random
 import base64
 import io
 import os
+import csv
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -21,7 +22,7 @@ load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env", override=False)
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 from PIL import Image
@@ -485,6 +486,113 @@ def open_and_enter_site(driver, wait):
     return True
 
 # ============================================================================
+# CSV Loader
+# ============================================================================
+
+SEARCH_CSV = "sample_data.csv"
+
+# Maps the display name in the CSV to the <option value> in the Court Department dropdown
+DEPT_VALUE_MAP = {
+    "BMC":                        "BMC_DEPT  ",
+    "District Court":             "DC_DEPT   ",
+    "Housing Court":              "HC_DEPT   ",
+    "Land Court Department":      "LC_DEPT   ",
+    "Probate and Family Court":   "PF_DEPT   ",
+    "The Superior Court":         "SC_DEPT   ",
+}
+
+def load_search_rows(csv_path=SEARCH_CSV):
+    """Load all rows from the search CSV. Returns list of dicts."""
+    rows = []
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Strip whitespace from all values
+                rows.append({k: v.strip() for k, v in row.items()})
+        log.info(f"[CSV] Loaded {len(rows)} row(s) from {csv_path}")
+    except FileNotFoundError:
+        log.error(f"[CSV] File not found: {csv_path}")
+    return rows
+
+
+# ============================================================================
+# Step 2 — Fill search form (Department → Division → Results per page)
+# ============================================================================
+
+def wicket_select(driver, select_el, value_or_text, by_value=False):
+    """
+    Select an option in a Wicket-enhanced <select>.
+    Wicket fires an onchange AJAX call after selection — we wait for any
+    pending network activity to settle before returning.
+    """
+    sel = Select(select_el)
+    if by_value:
+        sel.select_by_value(value_or_text)
+    else:
+        sel.select_by_visible_text(value_or_text)
+    human_delay(1.5, 2.5)   # let Wicket AJAX update the dependent dropdowns
+
+
+def fill_search_form(driver, wait, row):
+    """
+    Fill the search qualifier form for one CSV row:
+      1. Select Court Department  (triggers AJAX → reveals Division dropdown)
+      2. Select Court Division    (triggers AJAX → reveals Location dropdown)
+      3. Set Number of Results to 75
+
+    `row` is a dict with keys: CourtDepartments, CourtDivision, CaseType,
+    PartyType, FilingDateFrom, FilingDateTo
+    """
+    dept_display = row.get("CourtDepartments", "").strip()
+    div_display  = row.get("CourtDivision", "").strip()
+
+    log.info(f"[FORM] Department='{dept_display}'  Division='{div_display}'")
+
+    # ── 1. Court Department ──────────────────────────────────────────────────
+    dept_value = DEPT_VALUE_MAP.get(dept_display)
+    if not dept_value:
+        log.error(f"[FORM] Unknown department '{dept_display}'. "
+                  f"Valid values: {list(DEPT_VALUE_MAP.keys())}")
+        return False
+
+    try:
+        dept_select_el = wait.until(
+            EC.presence_of_element_located((By.NAME, "sdeptCd"))
+        )
+        wicket_select(driver, dept_select_el, dept_value, by_value=True)
+        log.info(f"[FORM] Selected department: {dept_display}")
+    except Exception as e:
+        log.error(f"[FORM] Could not select department: {e}")
+        return False
+
+    # ── 2. Court Division (appears after AJAX update) ────────────────────────
+    try:
+        # Wait for the division dropdown to become visible
+        div_select_el = WebDriverWait(driver, 15).until(
+            EC.visibility_of_element_located((By.NAME, "sdivCd"))
+        )
+        wicket_select(driver, div_select_el, div_display, by_value=False)
+        log.info(f"[FORM] Selected division: {div_display}")
+    except Exception as e:
+        log.error(f"[FORM] Could not select division '{div_display}': {e}")
+        return False
+
+    # ── 3. Number of Results → 75 ────────────────────────────────────────────
+    try:
+        page_size_el = wait.until(
+            EC.presence_of_element_located((By.NAME, "pageSize"))
+        )
+        wicket_select(driver, page_size_el, "75", by_value=False)
+        log.info("[FORM] Set results per page to 75.")
+    except Exception as e:
+        log.error(f"[FORM] Could not set page size: {e}")
+        return False
+
+    return True
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -494,6 +602,11 @@ def main():
     log.info("MA Trial Court — Search by Case Type Crawler")
     log.info("=" * 60)
 
+    search_rows = load_search_rows(SEARCH_CSV)
+    if not search_rows:
+        log.error(f"No rows found in {SEARCH_CSV}. Exiting.")
+        return
+
     options = webdriver.ChromeOptions()
     # Uncomment below to run headless (no browser window):
     # options.add_argument("--headless=new")
@@ -502,13 +615,29 @@ def main():
     wait = WebDriverWait(driver, 20)
 
     try:
+        # ── Step 1: welcome page → captcha → click "Click Here" ──────────────
         success = open_and_enter_site(driver, wait)
-        if success:
-            log.info("[DONE] Step 1 complete — now on search page.")
-            log.info(f"[URL]  {driver.current_url}")
-            # Step 2 (search form fill) will be added here next
-        else:
+        if not success:
             log.error("[FAIL] Could not get past the welcome page.")
+            return
+
+        log.info("[DONE] Step 1 complete — now on search page.")
+        log.info(f"[URL]  {driver.current_url}")
+
+        # ── Step 2: fill search form for each CSV row ─────────────────────────
+        for i, row in enumerate(search_rows):
+            log.info(f"--- [{i+1}/{len(search_rows)}] "
+                     f"{row.get('CourtDepartments')} / {row.get('CourtDivision')} ---")
+
+            ok = fill_search_form(driver, wait, row)
+            if ok:
+                log.info(f"[DONE] Step 2 complete for row {i+1}.")
+                # Step 3 (submit + paginate + extract) will be added here
+            else:
+                log.warning(f"[SKIP] Row {i+1} — form fill failed.")
+
+            human_delay(2.0, 3.0)
+
     except Exception as e:
         log.error(f"[FATAL] {e}")
     finally:
