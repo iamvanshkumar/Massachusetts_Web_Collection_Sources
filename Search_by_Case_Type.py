@@ -527,7 +527,7 @@ def write_row_to_csv(row, search_meta):
     fieldnames = [
         "CourtDepartment", "CourtDivision", "SearchBeginDate", "SearchEndDate",
         "CaseNumber", "CaseType", "FileDate", "DateOfBirth", "CaseStatus", "Court",
-        "NameRaw",
+        "NameRaw", "Alias",
     ]
     with open(filepath, "a", newline="", encoding="utf-8", buffering=1) as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
@@ -539,36 +539,98 @@ def write_row_to_csv(row, search_meta):
         os.fsync(f.fileno())
 
 
-def extract_name_raw(driver):
+def extract_alias(party_div):
     """
-    Extract NameRaw from the case detail page.
-    Looks for the first party whose ptyType is '- Defendant' and returns
-    the text of the sibling ptyInfoLabel div.
-    Falls back to the first ptyInfoLabel if no Defendant is found.
-    Returns empty string if nothing found.
+    Extract alias text from a single party block.
+
+    Structure:
+      <div class="box ptyAffl">
+        <h5>Alias</h5>
+        <!-- optional alias content in any tags, or nothing -->
+      </div>
+
+    Rules:
+    - Only extract if h5 text is exactly "Alias"
+    - Strip the h5 heading text from output
+    - Collect all remaining text regardless of tag structure
+    - Return "" if nothing meaningful remains
+    """
+    affl_div = party_div.find("div", class_="ptyAffl")
+    if not affl_div:
+        return ""
+
+    # Confirm heading is "Alias"
+    h5 = affl_div.find("h5")
+    if not h5 or h5.get_text(strip=True).lower() != "alias":
+        return ""
+
+    # Collect text from all nodes except the h5 heading
+    texts = []
+    for node in affl_div.children:
+        if getattr(node, "name", None) == "h5":
+            continue
+        if hasattr(node, "get_text"):
+            t = node.get_text(separator=" ", strip=True)
+        else:
+            t = str(node).strip()
+        if t:
+            texts.append(t)
+
+    # Flatten, split on newlines/semicolons, dedupe, drop empty
+    values = []
+    for chunk in texts:
+        for part in re.split(r"[\n;]+", chunk):
+            part = re.sub(r"\s+", " ", part).strip()
+            if part and part not in values:
+                values.append(part)
+
+    return "; ".join(values)
+
+
+def extract_party_info(driver):
+    """
+    Extract NameRaw and Alias for the Defendant from the case detail page.
+    Returns (name_raw, alias) tuple — both strings, empty if not found.
     """
     from bs4 import BeautifulSoup
     soup = BeautifulSoup(driver.page_source, "html.parser")
 
     pty_container = soup.find("div", id="ptyContainer")
     if not pty_container:
-        return ""
+        return "", ""
 
-    for party_div in pty_container.find_all("div", recursive=False):
+    # First pass: find the Defendant party block
+    # Party blocks are div.rowodd / div.roweven inside ptyContainer
+    defendant_div = None
+    for party_div in pty_container.find_all("div", class_=["rowodd", "roweven"], recursive=False):
         header = party_div.find("div", class_="subSectionHeader2")
         if not header:
             continue
         pty_type_div = header.find("div", class_="ptyType")
-        pty_name_div = header.find("div", class_="ptyInfoLabel")
-        if not pty_name_div:
-            continue
-        pty_type_text = pty_type_div.get_text(strip=True) if pty_type_div else ""
-        if "defendant" in pty_type_text.lower():
-            return pty_name_div.get_text(strip=True)
+        if pty_type_div and "defendant" in pty_type_div.get_text(strip=True).lower():
+            defendant_div = party_div
+            break
 
-    # Fallback: return first ptyInfoLabel found
-    first = pty_container.find("div", class_="ptyInfoLabel")
-    return first.get_text(strip=True) if first else ""
+    # Fallback: use first party block
+    if not defendant_div:
+        blocks = pty_container.find_all("div", class_=["rowodd", "roweven"], recursive=False)
+        defendant_div = blocks[0] if blocks else None
+
+    if not defendant_div:
+        return "", ""
+
+    # NameRaw
+    header = defendant_div.find("div", class_="subSectionHeader2")
+    name_raw = ""
+    if header:
+        name_div = header.find("div", class_="ptyInfoLabel")
+        if name_div:
+            name_raw = name_div.get_text(strip=True)
+
+    # Alias
+    alias = extract_alias(defendant_div)
+
+    return name_raw, alias
 
 
 def visit_and_enrich(driver, wait, result_rows, results_page_url, search_meta):
@@ -583,6 +645,7 @@ def visit_and_enrich(driver, wait, result_rows, results_page_url, search_meta):
         href = row.pop("_case_href", "")
         if not href:
             row["NameRaw"] = ""
+            row["Alias"]   = ""
             write_row_to_csv(row, search_meta)
             continue
 
@@ -595,11 +658,12 @@ def visit_and_enrich(driver, wait, result_rows, results_page_url, search_meta):
                 EC.presence_of_element_located((By.ID, "caseDetail"))
             )
             human_delay(1.0, 2.0)
-            row["NameRaw"] = extract_name_raw(driver)
-            log.info(f"[DETAIL] NameRaw='{row['NameRaw']}'")
+            row["NameRaw"], row["Alias"] = extract_party_info(driver)
+            log.info(f"[DETAIL] NameRaw='{row['NameRaw']}'  Alias='{row['Alias']}'")
         except Exception as e:
             log.warning(f"[DETAIL] Failed for {case_num}: {e}")
             row["NameRaw"] = ""
+            row["Alias"]   = ""
 
         # Write immediately — one row, one case
         write_row_to_csv(row, search_meta)
