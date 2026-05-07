@@ -519,15 +519,20 @@ def append_results_to_csv(rows, search_meta):
 
 
 def write_row_to_csv(row, search_meta):
-    """Write a single enriched row to output/results.csv immediately."""
+    """Write a single charge row to output/results.csv immediately."""
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     filepath     = os.path.join(OUTPUT_DIR, "results.csv")
     write_header = not os.path.exists(filepath)
 
     fieldnames = [
+        # Search context
         "CourtDepartment", "CourtDivision", "SearchBeginDate", "SearchEndDate",
+        # From results grid
         "CaseNumber", "CaseType", "FileDate", "DateOfBirth", "CaseStatus", "Court",
+        # From case detail — party
         "NameRaw", "Alias",
+        # From case detail — per charge
+        "ChargeLevel", "Statute", "StatuteDescription",
     ]
     with open(filepath, "a", newline="", encoding="utf-8", buffering=1) as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, restval="")
@@ -633,23 +638,164 @@ def extract_party_info(driver):
     return name_raw, alias
 
 
+def _parse_original_charge(raw_text):
+    """
+    Parse the ptyChgInfo text for Original Charge into
+    (Statute, StatuteDescription).
+
+    Input examples:
+      "90/25/D-0 STOP FOR POLICE, FAIL c90 §25 (Misdemeanor - 100 days...)"
+      "89/4A-0 MARKED LANES VIOLATION * c89 §4A (Civil Motor Vehicle Infraction)"
+      "700CMR709/SS-0 MASS PIKE - SPEEDING TO ENDANGER * 700 CMR §7.09(6)(b) (Civil...)"
+
+    Statute patterns:
+      - c<digit>...   e.g. c90 §25, c89 §4A
+      - <digits> CMR §...  e.g. 700 CMR §7.09(6)(b)
+
+    StatuteDescription: text between leading charge code and statute reference,
+    with trailing parenthetical removed.
+    """
+    raw = re.sub(r"\s+", " ", raw_text).strip()
+
+    # Try to find statute — two patterns:
+    # 1. c<digit> followed by legal notation
+    # 2. <digits> CMR §...
+    statute_match = re.search(
+        r"((?:\d+\s+CMR\s+§[\w\.\(\)\-/]+)|(?:c\d[\w§\(\)\.\-/\s]*))",
+        raw
+    )
+    statute = statute_match.group(1).strip() if statute_match else ""
+
+    # Remove statute from raw to isolate description
+    without_statute = raw[:statute_match.start()].strip() if statute_match else raw
+
+    # Remove leading charge code (e.g. "90/25/D-0 " or "700CMR709/SS-0 ")
+    without_code = re.sub(r"^[\w/\-]+\s+", "", without_statute).strip()
+
+    # Remove trailing parenthetical "(Misdemeanor - ...)"
+    statute_description = re.sub(r"\s*\(.*\)\s*$", "", without_code).strip()
+    # Also strip trailing asterisk/spaces
+    statute_description = statute_description.rstrip("* ").strip()
+
+    return statute, statute_description
+
+
+def extract_charges(driver):
+    """
+    Extract all charges from the Party Charge Information section.
+
+    DOM structure (confirmed from live HTML):
+      div#chgContainer
+        div#idf05  (wrapper, dynamic id)
+          div.rowodd   id="idf06"   <- charge 1  (has chgHeadDeg + chgPhase directly)
+          div.roweven  id="idf09"   <- charge 2
+          ...
+          div.roweven  id="idf2a"   <- charge 6  (loaded via "Load All")
+            div id="idf2d"          <- inner wrapper
+              div.subSectionHeader2 ...
+              div.chgData ...
+          div.rowodd   id="idf2b"   <- charge 7
+            div id="idf30"
+              ...
+
+    A charge block is identified by containing <span class="chgHeadDeg">.
+    We find ALL such spans in chgContainer and walk up to their containing
+    rowodd/roweven block — this handles both flat and nested structures.
+    """
+    from bs4 import BeautifulSoup
+
+    # ── Step 1: click "Load All Party Charges" if present ────────────────────
+    try:
+        load_all = driver.find_element(
+            By.XPATH,
+            "//a[contains(@class,'chgAdditional') and "
+            "contains(normalize-space(.),'Load All')]"
+        )
+        if load_all.is_displayed():
+            driver.execute_script("arguments[0].click();", load_all)
+            log.info("[CHARGES] Clicked 'Load All Party Charges'.")
+            try:
+                WebDriverWait(driver, 15).until(
+                    EC.invisibility_of_element(load_all)
+                )
+            except Exception:
+                pass
+            human_delay(1.0, 2.0)
+    except Exception:
+        pass
+
+    # ── Step 2: parse ─────────────────────────────────────────────────────────
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    chg_container = soup.find("div", id="chgContainer")
+    if not chg_container:
+        log.warning("[CHARGES] #chgContainer not found.")
+        return []
+
+    # Find every chgHeadDeg span — one per charge, regardless of nesting depth
+    deg_spans = chg_container.find_all("span", class_="chgHeadDeg")
+    if not deg_spans:
+        log.warning("[CHARGES] No chgHeadDeg spans found.")
+        return []
+
+    charges = []
+    for deg_span in deg_spans:
+        charge_level = deg_span.get_text(strip=True)
+
+        # Walk up to find the enclosing rowodd/roweven block for this charge
+        block = deg_span.parent
+        while block and block.name != "div":
+            block = block.parent
+        while block:
+            classes = block.get("class") or []
+            if "rowodd" in classes or "roweven" in classes:
+                break
+            block = block.parent
+
+        if not block:
+            continue
+
+        # Original Charge — find chgPhase anywhere inside this block
+        statute = ""
+        statute_description = ""
+        chg_phase = block.find("div", class_="chgPhase")
+        if chg_phase:
+            for lbl in chg_phase.find_all("li", class_="ptyChgLabel"):
+                if "original charge" in lbl.get_text(strip=True).lower():
+                    info_li = lbl.find_next_sibling("li", class_="ptyChgInfo")
+                    if info_li:
+                        raw = info_li.get_text(" ", strip=True)
+                        statute, statute_description = _parse_original_charge(raw)
+                    break
+
+        charges.append({
+            "ChargeLevel":        charge_level,
+            "Statute":            statute,
+            "StatuteDescription": statute_description,
+        })
+
+    log.info(f"[CHARGES] Extracted {len(charges)} charge(s).")
+    return charges
+
+
 def visit_and_enrich(driver, wait, result_rows, results_page_url, search_meta):
     """
     For each result row:
       1. Navigate to the case detail page
-      2. Extract NameRaw
-      3. Write the row to CSV immediately (runtime, one row per case)
+      2. Extract NameRaw, Alias, and all charges
+      3. Write one CSV row per charge immediately (runtime)
+         If no charges found, write one row with empty charge fields
       4. Return to the results page
     """
     for i, row in enumerate(result_rows):
         href = row.pop("_case_href", "")
+        case_num = row.get("CaseNumber", "?")
+
         if not href:
-            row["NameRaw"] = ""
-            row["Alias"]   = ""
+            row.update({"NameRaw": "", "Alias": "",
+                        "ChargeLevel": "", "Statute": "", "StatuteDescription": ""})
             write_row_to_csv(row, search_meta)
             continue
 
-        case_num = row.get("CaseNumber", "?")
         log.info(f"[DETAIL] [{i+1}/{len(result_rows)}] {case_num}")
 
         try:
@@ -658,16 +804,29 @@ def visit_and_enrich(driver, wait, result_rows, results_page_url, search_meta):
                 EC.presence_of_element_located((By.ID, "caseDetail"))
             )
             human_delay(1.0, 2.0)
-            row["NameRaw"], row["Alias"] = extract_party_info(driver)
-            log.info(f"[DETAIL] NameRaw='{row['NameRaw']}'  Alias='{row['Alias']}'")
+
+            name_raw, alias = extract_party_info(driver)
+            charges         = extract_charges(driver)
+            log.info(f"[DETAIL] NameRaw='{name_raw}'  Alias='{alias}'  "
+                     f"Charges={len(charges)}")
+
         except Exception as e:
             log.warning(f"[DETAIL] Failed for {case_num}: {e}")
-            row["NameRaw"] = ""
-            row["Alias"]   = ""
+            name_raw, alias, charges = "", "", []
 
-        # Write immediately — one row, one case
-        write_row_to_csv(row, search_meta)
-        log.info(f"[SAVE]   Written: {case_num}")
+        # Base fields shared across all charge rows
+        base = {**row, "NameRaw": name_raw, "Alias": alias}
+
+        if charges:
+            for charge in charges:
+                write_row_to_csv({**base, **charge}, search_meta)
+            log.info(f"[SAVE]   {case_num} — {len(charges)} charge row(s) written.")
+        else:
+            # No charges found — write one row with empty charge fields
+            write_row_to_csv({**base,
+                              "ChargeLevel": "", "Statute": "",
+                              "StatuteDescription": ""}, search_meta)
+            log.info(f"[SAVE]   {case_num} — 1 row written (no charges).")
 
         # Return to results page
         try:
@@ -807,14 +966,14 @@ def paginate_and_collect(driver, wait, search_meta):
 def date_range_chunks(begin_str, end_str, chunk="week"):
     """
     Split a date range (MM/DD/YYYY strings) into sub-ranges.
-    chunk = 'week' → 7-day chunks
-    chunk = 'day'  → 1-day chunks
+    chunk = 'week' -> 7-day chunks  (Mon -> Sun, i.e. begin to begin+6)
+    chunk = 'day'  -> 2-day chunks  (begin to begin+1, so site returns that day's results)
     Yields (begin_str, end_str) pairs.
     """
     fmt = "%m/%d/%Y"
     start = datetime.strptime(begin_str, fmt)
     end   = datetime.strptime(end_str,   fmt)
-    delta = timedelta(days=6 if chunk == "week" else 0)
+    delta = timedelta(days=6 if chunk == "week" else 1)
 
     current = start
     while current <= end:
@@ -823,30 +982,45 @@ def date_range_chunks(begin_str, end_str, chunk="week"):
         current = chunk_end + timedelta(days=1)
 
 
+def navigate_to_search_via_nav(driver, wait):
+    """
+    Click the 'Search' link in the global navigation bar to return to the
+    search form without losing the Wicket session.
+    Falls back to the home-page flow if the nav link is not found.
+    Returns True on success.
+    """
+    try:
+        # The Search nav link — identified by its text and position in nav-left
+        search_nav = wait.until(
+            EC.element_to_be_clickable(
+                (By.XPATH,
+                 "//ul[contains(@class,'nav-left')]"
+                 "//a[contains(@class,'link') and normalize-space(text())='Search']")
+            )
+        )
+        driver.execute_script("arguments[0].click();", search_nav)
+        log.info("[NAV] Clicked 'Search' nav link.")
+
+        # Wait for the qualifier form to be ready
+        WebDriverWait(driver, 20).until(
+            EC.element_to_be_clickable((By.NAME, "sdeptCd"))
+        )
+        human_delay(1.5, 2.0)
+        log.info(f"[NAV] Search form ready. URL: {driver.current_url}")
+        return True
+    except Exception as e:
+        log.warning(f"[NAV] Search nav link failed ({e}), falling back to home page flow.")
+        return open_and_enter_site(driver, wait)
+
+
 def run_one_search(driver, wait, row):
     """
-    Navigate to the search page (using 'Revise Current Search' if already on
-    results, or directly to the search URL), fill the qualifier form
-    (Department → Division → page size), click the Case Type tab, fill that
-    form, and submit.  Returns True on success.
+    Navigate to the search form via the 'Search' nav link (keeps Wicket
+    session alive), fill the qualifier form, click the Case Type tab,
+    fill that form, and submit. Returns True on success.
     """
-    # If we're on the results page, click "Revise Current Search" to go back
-    # to the search form without losing the session.  Otherwise navigate directly.
-    try:
-        revise_link = driver.find_element(
-            By.XPATH,
-            "//a[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
-            "'abcdefghijklmnopqrstuvwxyz'),'revise current search')]"
-        )
-        driver.execute_script("arguments[0].click();", revise_link)
-        log.info("[NAV] Clicked 'Revise Current Search'.")
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.NAME, "sdeptCd"))
-        )
-        human_delay(1.5, 2.5)
-    except Exception:
-        # Not on results page — fill the qualifier form that's already visible
-        pass
+    if not navigate_to_search_via_nav(driver, wait):
+        return False
 
     # ── Qualifier form: Department → Division → page size ────────────────────
     dept_display = row.get("CourtDepartments", "").strip()
@@ -858,7 +1032,7 @@ def run_one_search(driver, wait, row):
         return False
 
     try:
-        dept_select_el = wait.until(EC.presence_of_element_located((By.NAME, "sdeptCd")))
+        dept_select_el = wait.until(EC.element_to_be_clickable((By.NAME, "sdeptCd")))
         wicket_select(driver, dept_select_el, dept_value, by_value=True)
         log.info(f"[FORM] Selected department: {dept_display}")
     except Exception as e:
@@ -885,7 +1059,13 @@ def run_one_search(driver, wait, row):
 
     # ── Case Type tab ─────────────────────────────────────────────────────────
     try:
-        case_type_tab = wait.until(
+        # Wait for the tab section to be rendered by Wicket AJAX first
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.ID, "searchPageTabSection"))
+        )
+        human_delay(0.5, 1.0)
+
+        case_type_tab = WebDriverWait(driver, 20).until(
             EC.element_to_be_clickable(
                 (By.XPATH, "//ul/li/a[.//span[normalize-space(text())='Case Type']]")
             )
@@ -913,23 +1093,22 @@ def collect_with_smart_split(driver, wait, row, begin_date, end_date, search_met
     """
     Recursively collect results, splitting the date range if >100 records.
     depth 0 = month range, depth 1 = week chunks, depth 2 = day chunks.
-    Returns list of row dicts.
+    Returns total number of rows written.
     """
     MAX_DEPTH = 2
     CHUNK_NAMES = ["month", "week", "day"]
 
-    log.info(f"[SPLIT] Searching {begin_date} → {end_date} "
+    log.info(f"[SPLIT] Searching {begin_date} -> {end_date} "
              f"(depth={depth}, chunk={CHUNK_NAMES[depth]})")
 
     # Fill and submit the form for this date range
     sub_row = {**row, "FilingDateFrom": begin_date, "FilingDateTo": end_date}
-    # Dates already in MM/DD/YYYY — pass directly (convert_date will pass through)
     ok = run_one_search(driver, wait, sub_row)
     if not ok:
-        log.warning(f"[SPLIT] Form fill failed for {begin_date}→{end_date}")
-        return []
+        log.warning(f"[SPLIT] Form fill failed for {begin_date}->{end_date}, skipping.")
+        return 0   # always return int
 
-    # Wait for results
+    # Wait for results page
     try:
         WebDriverWait(driver, 30).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "table#grid, #srchResultNotice"))
@@ -945,14 +1124,17 @@ def collect_with_smart_split(driver, wait, row, begin_date, end_date, search_met
         # Collect all pages, write each row immediately
         return paginate_and_collect(driver, wait, search_meta)
 
-    # Need to split further
+    # Need to split further — navigate back to search form first
+    log.info(f"[SPLIT] {total} results > 100, splitting into "
+             f"{'weeks' if depth == 0 else 'days'}...")
+
     next_chunk = "week" if depth == 0 else "day"
     total_written = 0
     for chunk_begin, chunk_end in date_range_chunks(begin_date, end_date, chunk=next_chunk):
         chunk_written = collect_with_smart_split(
             driver, wait, row, chunk_begin, chunk_end, search_meta, depth=depth + 1
         )
-        total_written += chunk_written
+        total_written += chunk_written   # chunk_written is always int now
         human_delay(1.0, 2.0)
     return total_written
 
@@ -1204,14 +1386,20 @@ def main():
     wait = WebDriverWait(driver, 20)
 
     try:
-        # ── Step 1: welcome page → captcha → click "Click Here" ──────────────
-        success = open_and_enter_site(driver, wait)
-        if not success:
+        # ── Step 1: enter site via home page (captcha + Click Here) ──────────
+        log.info("[STEP 1] Entering site via home page...")
+        if not open_and_enter_site(driver, wait):
             log.error("[FAIL] Could not get past the welcome page.")
             return
-
-        log.info("[DONE] Step 1 complete — now on search page.")
-        log.info(f"[URL]  {driver.current_url}")
+        # Wait for the search page tab section to fully render before first search
+        try:
+            WebDriverWait(driver, 20).until(
+                EC.presence_of_element_located((By.ID, "searchPageTabSection"))
+            )
+            human_delay(1.0, 1.5)
+        except Exception:
+            pass
+        log.info(f"[STEP 1] Done. URL: {driver.current_url}")
 
         # ── Step 2+3: for each CSV row, fill form + collect results ──────────
         for i, row in enumerate(search_rows):
@@ -1220,7 +1408,7 @@ def main():
             begin  = convert_date(row.get("FilingDateFrom", ""))
             end    = convert_date(row.get("FilingDateTo", ""))
             log.info(f"--- [{i+1}/{len(search_rows)}] {dept} / {div} "
-                     f"{begin} → {end} ---")
+                     f"{begin} -> {end} ---")
 
             search_meta = {
                 "CourtDepartment":  dept,
@@ -1229,8 +1417,8 @@ def main():
                 "SearchEndDate":    end,
             }
 
-            all_rows = collect_with_smart_split(driver, wait, row, begin, end, search_meta, depth=0)
-            log.info(f"[DONE] Row {i+1}: {all_rows} total records written.")
+            total = collect_with_smart_split(driver, wait, row, begin, end, search_meta, depth=0)
+            log.info(f"[DONE] Row {i+1}: {total} total records written.")
             human_delay(2.0, 3.0)
 
     except Exception as e:
