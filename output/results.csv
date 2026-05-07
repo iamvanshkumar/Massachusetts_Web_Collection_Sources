@@ -1,0 +1,8 @@
+CourtDepartment,CourtDivision,SearchBeginDate,SearchEndDate,CaseNumber,CaseType,FileDate,DateOfBirth,CaseStatus,Court,NameRaw,Alias,ChargeLevel,Statute,StatuteDescription
+BMC,BMC Central,06/01/2025,06/30/2025,2501CR002726,Criminal,06/02/2025,xx/xx/2001,Closed,BMC Central,"Magner, Joshua L",,,,
+BMC,BMC Central,06/01/2025,06/30/2025,2501CR002727,Criminal,06/02/2025,xx/xx/2001,Closed,BMC Central,"Majluf, Joaquin",,,,
+BMC,BMC Central,06/01/2025,06/30/2025,2501CR002728,Criminal,06/02/2025,xx/xx/1963,Closed,BMC Central,"Malave, Angel L",,,,
+BMC,BMC Central,06/01/2025,06/30/2025,2501CR002729,Criminal,06/02/2025,xx/xx/1982,Closed,BMC Central,"Marquez, Matthew M",,,,
+BMC,BMC Brighton,06/01/2025,06/30/2025,2508CR000355,Criminal,06/02/2025,xx/xx/1998,Open,BMC Brighton,"Boldewskul, Alexander",,Felony,c266 §126A (Felony),VANDALIZE WAR/VETERANS MEMORIAL
+BMC,BMC Brighton,06/01/2025,06/30/2025,2508CR000356,Criminal,06/02/2025,xx/xx/1993,Closed,BMC Brighton,"Sherif, Lina Sultan",,Misdemeanor - 100 days or less incarceration,c272 §53 (Misdemeanor - 100 days or less incarceration),DISORDERLY CONDUCT
+BMC,BMC Brighton,06/01/2025,06/30/2025,2508CR000357,Criminal,06/02/2025,xx/xx/2001,Open,BMC Brighton,"Godoy Ramirez, Mariela",,Misdemeanor - more than 100 days incarceration,c90 §24(1)(a)(1) (Misdemeanor - more than 100 days incarceration),"OUI-LIQUOR OR .08%, 2ND OFFENSE"

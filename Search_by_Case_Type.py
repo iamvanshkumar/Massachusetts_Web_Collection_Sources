@@ -71,6 +71,27 @@ log = logging.getLogger(__name__)
 def human_delay(min_sec=0.8, max_sec=2.2):
     time.sleep(random.uniform(min_sec, max_sec))
 
+
+def get_soup(driver):
+    """
+    Return a BeautifulSoup of the current page, correctly decoded as UTF-8.
+    driver.page_source can return a Latin-1 mangled string on some platforms
+    (e.g. § U+00A7 becomes Â§). Using the raw bytes via JS avoids this.
+    """
+    from bs4 import BeautifulSoup
+    try:
+        # Get the outer HTML as a proper Python str via JS (already Unicode)
+        html = driver.execute_script("return document.documentElement.outerHTML;")
+        return BeautifulSoup(html, "html.parser")
+    except Exception:
+        # Fallback: encode page_source as latin-1 then decode as utf-8
+        raw = driver.page_source
+        try:
+            raw = raw.encode("latin-1").decode("utf-8")
+        except Exception:
+            pass
+        return BeautifulSoup(raw, "html.parser")
+
 def human_move_and_click(driver, element):
     ActionChains(driver)\
         .move_to_element(element)\
@@ -597,8 +618,7 @@ def extract_party_info(driver):
     Extract NameRaw and Alias for the Defendant from the case detail page.
     Returns (name_raw, alias) tuple — both strings, empty if not found.
     """
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(driver.page_source, "html.parser")
+    soup = get_soup(driver)
 
     pty_container = soup.find("div", id="ptyContainer")
     if not pty_container:
@@ -725,7 +745,7 @@ def extract_charges(driver):
         pass
 
     # ── Step 2: parse ─────────────────────────────────────────────────────────
-    soup = BeautifulSoup(driver.page_source, "html.parser")
+    soup = get_soup(driver)
     chg_container = soup.find("div", id="chgContainer")
     if not chg_container:
         log.warning("[CHARGES] #chgContainer not found.")
@@ -885,8 +905,7 @@ def extract_results_from_page(driver):
     Also captures the href of the CaseNumber link for detail-page navigation.
     Returns list of dicts.
     """
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(driver.page_source, "html.parser")
+    soup = get_soup(driver)
     table = soup.find("table", id="grid")
     if not table:
         return []
